@@ -18,4 +18,4 @@ A script for the secure installation of an API to control and monitor your Raspb
 Run the following command in your Raspberry Pi terminal:
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/piotrkuzemczak-stack/RaspPi-Remote-Admin-API/main/garmin-admin-install.sh](https://raw.githubusercontent.com/piotrkuzemczak-stack/RaspPi-Remote-Admin-API/main/garmin-admin-install.sh) | sudo bash
+curl -sSL [https://raw.githubusercontent.com/piotrkuzemczak-stack/RaspPi-Remote-Admin-garmin_api/main/garmin-admin-install.sh](https://raw.githubusercontent.com/piotrkuzemczak-stack/RaspPi-Remote-Admin-garmin_api/main/garmin-admin-install.sh) | sudo bash
