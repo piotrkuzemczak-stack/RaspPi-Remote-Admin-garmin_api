@@ -42,8 +42,9 @@ echo -e "    - ${TOKEN_MSG}\n"
 
 # Step 1: Install Dependencies
 echo -e "${YELLOW}[Step 1/4] Installing system dependencies...${NC}"
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq > /dev/null 2>&1
-apt-get install -y -qq python3 python3-flask python3-waitress curl jq > /dev/null 2>&1
+apt-get install -y -qq python3 python3-flask python3-waitress curl jq procps > /dev/null 2>&1
 echo -e "${GREEN}[+] Dependencies installed successfully.${NC}\n"
 
 # Step 2: Tailscale & Funnel Authorization
@@ -88,16 +89,23 @@ fi
 echo -e "${GREEN}[+] Tailscale Funnel is active on: https://${TS_DOMAIN}${NC}\n"
 
 # Step 3: Application Structure & API Code
-echo -e "${YELLOW}[Step 3/4] Creating secure API application and User Services...${NC}"
+echo -e "${YELLOW}[Step 3/4] Creating secure API application and helper scripts...${NC}"
 APP_DIR="/opt/rasppi-remote"
 mkdir -p "$APP_DIR"
 
-# Generate User Services script in the user's home directory
-USER_HOME=$(eval echo ~${SUDO_USER:-root})
+# Safely determine the real user and their home directory
+REAL_USER="${SUDO_USER:-root}"
+USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+    USER_HOME="/root"
+fi
+
+# 1. Generate User Services script
 cat << 'EOF' > "$USER_HOME/user_services.sh"
 #!/bin/bash
+export LC_ALL=C
 echo "=== USER SERVICES ==="
-USER_SERVICES=$(find /etc/systemd/system -maxdepth 1 -type f -name "*.service" -printf "%f\n" | sed 's/\.service//' | sort)
+USER_SERVICES=$(find /etc/systemd/system -maxdepth 1 -type f -name "*.service" -printf "%f\n" 2>/dev/null | sed 's/\.service//' | sort)
 if [ -z "$USER_SERVICES" ]; then
     echo "No custom user"
     echo "services found."
@@ -105,28 +113,44 @@ if [ -z "$USER_SERVICES" ]; then
 fi
 COUNT_ON=0; COUNT_OFF=0; COUNT_FAIL=0
 for s in $USER_SERVICES; do
-    if systemctl is-failed --quiet "${s}.service"; then
+    if systemctl is-failed --quiet "${s}.service" 2>/dev/null; then
         echo "🚨 $s"
-        ((COUNT_FAIL++))
-    elif systemctl is-active --quiet "${s}.service"; then
+        COUNT_FAIL=$((COUNT_FAIL + 1))
+    elif systemctl is-active --quiet "${s}.service" 2>/dev/null; then
         echo "🟢 $s"
-        ((COUNT_ON++))
+        COUNT_ON=$((COUNT_ON + 1))
     else
         echo "🔴 $s"
-        ((COUNT_OFF++))
+        COUNT_OFF=$((COUNT_OFF + 1))
     fi
 done
 echo "-------------------"
 echo "ON: $COUNT_ON | OFF: $COUNT_OFF | ERR: $COUNT_FAIL"
 EOF
-chmod +x "$USER_HOME/user_services.sh"
+
+chmod 755 "$USER_HOME/user_services.sh"
 if [ "$USER_HOME" != "/root" ]; then
-    chown $(stat -c '%U:%G' "$USER_HOME") "$USER_HOME/user_services.sh"
+    chown "$REAL_USER":"$REAL_USER" "$USER_HOME/user_services.sh" 2>/dev/null || true
 fi
 
+# 2. Generate Top Hogs script in APP_DIR
+cat << 'EOF' > "$APP_DIR/top_hogs.sh"
+#!/bin/bash
+export LC_ALL=C
+echo "🔥 TOP CPU:"
+ps -eo comm,%cpu --sort=-%cpu | awk 'NR>1 && NR<=4 {printf "▪️ %-10s %s%%\n", substr($1,1,10), $2}'
+echo "💻 TOP RAM:"
+ps -eo comm,%mem --sort=-%mem | awk 'NR>1 && NR<=4 {printf "▪️ %-10s %s%%\n", substr($1,1,10), $2}'
+EOF
+
+chmod 755 "$APP_DIR/top_hogs.sh"
+
+# 3. Prepare authentication log file
 touch /var/log/rasppi-remote-auth.log
 chmod 600 /var/log/rasppi-remote-auth.log
+chown root:root /var/log/rasppi-remote-auth.log
 
+# 4. Generate main Python API server
 cat << 'EOF' > "$APP_DIR/garmin_api.py"
 from flask import Flask, jsonify, request
 import subprocess
@@ -226,12 +250,7 @@ COMMANDS = {
         [ "$STOP" -gt 0 ] && docker ps -f "status=exited" --format "🔴 {{.Names}}" | head -n 4
         exit 0
     """.strip(),
-    "top_hogs": """
-        echo "🔥 TOP CPU:"
-        ps -eo comm,%cpu --sort=-%cpu | awk 'NR>1 && NR<=4 {printf "▪️ %-10s %s%%\n", substr($1,1,10), $2}'
-        echo "💻 TOP RAM:"
-        ps -eo comm,%mem --sort=-%mem | awk 'NR>1 && NR<=4 {printf "▪️ %-10s %s%%\n", substr($1,1,10), $2}'
-    """.strip(),
+    "top_hogs": "/opt/rasppi-remote/top_hogs.sh",
     "net_info": """
         LAN_IP=$(hostname -I | awk '{print $1}')
         TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
@@ -341,6 +360,7 @@ def get_system_aliases():
                 with open(filepath, 'r', encoding='utf-8') as f:
                     for line in f:
                         line = line.strip()
+                        # 1. Classic aliases: alias name='command'
                         if line.startswith("alias "):
                             try:
                                 declaration = line[6:].strip()
@@ -353,6 +373,12 @@ def get_system_aliases():
                                     aliases[name] = cmd
                             except Exception:
                                 pass
+                        # 2. Bash functions: name() or function name()
+                        elif not line.startswith("#"):
+                            m = re.match(r'^(?:function\s+)?([a-zA-Z0-9_-]+)\s*\(\s*\)', line)
+                            if m:
+                                func_name = m.group(1)
+                                aliases[func_name] = f"eval \"$(sed '/^case \\$- in/,/esac/d' {filepath})\" >/dev/null 2>&1 && {func_name}"
             except Exception:
                 pass
     return aliases
@@ -440,17 +466,19 @@ if __name__ == '__main__':
     serve(app, host='0.0.0.0', port=port)
 EOF
 
-chmod 700 "$APP_DIR"
-chmod 600 "$APP_DIR/garmin_api.py"
+# Set strict and functional permissions
 chown -R root:root "$APP_DIR"
-echo -e "${GREEN}[+] API files generated securely.${NC}\n"
+chmod 755 "$APP_DIR"
+chmod 755 "$APP_DIR/top_hogs.sh"
+chmod 600 "$APP_DIR/garmin_api.py"
+echo -e "${GREEN}[+] API files and helper scripts generated securely.${NC}\n"
 
 # Step 4: System Services
 echo -e "${YELLOW}[Step 4/4] Configuring background services...${NC}"
 
 if systemctl is-active --quiet rasppi-cf-tunnel.service 2>/dev/null; then
-    systemctl stop rasppi-cf-tunnel.service 2>/dev/null
-    systemctl disable rasppi-cf-tunnel.service 2>/dev/null
+    systemctl stop rasppi-cf-tunnel.service 2>/dev/null || true
+    systemctl disable rasppi-cf-tunnel.service 2>/dev/null || true
     rm -f /etc/systemd/system/rasppi-cf-tunnel.service
 fi
 
@@ -460,6 +488,7 @@ API_PORT=$API_PORT
 USER_HOME=$USER_HOME
 EOF
 chmod 600 /etc/default/rasppi-remote
+chown root:root /etc/default/rasppi-remote
 
 cat << 'EOF' > /etc/systemd/system/rasppi-remote.service
 [Unit]
@@ -472,12 +501,14 @@ EnvironmentFile=/etc/default/rasppi-remote
 ExecStart=/usr/bin/python3 /opt/rasppi-remote/garmin_api.py
 WorkingDirectory=/opt/rasppi-remote
 Restart=always
+RestartSec=3
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+chmod 644 /etc/systemd/system/rasppi-remote.service
 systemctl daemon-reload
 systemctl enable rasppi-remote.service > /dev/null 2>&1
 systemctl restart rasppi-remote.service
