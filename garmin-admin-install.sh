@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e # Exit immediately if a command exits with a non-zero status
+set -e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -8,33 +8,41 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}   RaspPi-Remote Admin (Garmin IQ) - Server Setup Script    ${NC}"
+echo -e "${CYAN}    RaspPi-Remote Admin (Garmin IQ) - Server Setup Script${NC}"
 echo -e "${CYAN}============================================================${NC}"
 echo ""
 
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}[ERROR] Please run this script with sudo.${NC}"
-  echo -e "Try: ${YELLOW}curl -sSL <url> | sudo bash${NC}"
-  exit 1
+    echo -e "${RED}[ERROR] Please run this script with sudo.${NC}"
+    echo -e "Try: ${YELLOW}curl -sSL <url> | sudo bash${NC}"
+    exit 1
 fi
 
 echo -e "${YELLOW}Checking internet connection...${NC}"
-if ! ping -c 1 8.8.8.8 &> /dev/null; then
-  echo -e "${RED}[ERROR] No internet connection detected. Please check your network.${NC}"
-  exit 1
+if ! ping -c 1 -W 3 8.8.8.8 &> /dev/null && ! ping -c 1 -W 3 1.1.1.1 &> /dev/null; then
+    echo -e "${RED}[ERROR] No internet connection detected. Please check your network.${NC}"
+    exit 1
 fi
 echo -e "${GREEN}[+] Internet connection is OK.${NC}\n"
 
 API_PORT=${API_PORT:-8080}
 
-# Preserve existing token on reinstall/update, or generate a new one
-if [ -f /etc/default/rasppi-remote ] && grep -q "^SECURITY_TOKEN=" /etc/default/rasppi-remote; then
-    SECRET_TOKEN=$(grep "^SECURITY_TOKEN=" /etc/default/rasppi-remote | cut -d'=' -f2)
-    TOKEN_MSG="Existing Secure Token preserved."
-else
-    SECRET_TOKEN="_$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 14 || true)"
-    TOKEN_MSG="Secure Token generated automatically."
+SAVED_DOMAIN=""
+SECRET_TOKEN=""
+if [ -f /etc/default/rasppi-remote ]; then
+    SECRET_TOKEN=$(grep "^SECURITY_TOKEN=" /etc/default/rasppi-remote 2>/dev/null | tr -d '\r' | cut -d'=' -f2- | head -n1 | tr -d '[:space:]' || true)
+    SAVED_DOMAIN=$(grep "^TS_DOMAIN=" /etc/default/rasppi-remote 2>/dev/null | tr -d '\r' | cut -d'=' -f2- | head -n1 | tr -d '[:space:]' || true)
 fi
+
+case "$SECRET_TOKEN" in
+    ""|"UNSET")
+        SECRET_TOKEN="_$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 14 || true)"
+        TOKEN_MSG="Secure Token generated automatically."
+        ;;
+    *)
+        TOKEN_MSG="Existing Secure Token preserved."
+        ;;
+esac
 
 echo -e "${GREEN}[+] Automated configuration:${NC}"
 echo -e "    - Internal Port: ${YELLOW}$API_PORT${NC}"
@@ -44,7 +52,7 @@ echo -e "    - ${TOKEN_MSG}\n"
 echo -e "${YELLOW}[Step 1/4] Installing system dependencies...${NC}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq > /dev/null 2>&1
-apt-get install -y -qq python3 python3-flask python3-waitress curl jq procps > /dev/null 2>&1
+apt-get install -y -qq sudo python3 python3-flask python3-waitress curl jq procps iproute2 iw util-linux coreutils > /dev/null 2>&1
 echo -e "${GREEN}[+] Dependencies installed successfully.${NC}\n"
 
 # Step 2: Tailscale & Funnel Authorization
@@ -54,17 +62,23 @@ if ! command -v tailscale &> /dev/null; then
     curl -fsSL https://tailscale.com/install.sh | sh > /dev/null 2>&1
 fi
 
+systemctl enable --now tailscaled > /dev/null 2>&1 || true
+
 if ! tailscale status &> /dev/null; then
-    echo -e "${RED}[ERROR] Tailscale is not logged in.${NC}"
-    echo -e "Please run '${YELLOW}sudo tailscale up${NC}' manually to log in, then restart this script."
-    exit 1
+    echo -e "${YELLOW}Tailscale is not logged in. Starting authentication...${NC}"
+    if [ -r /dev/tty ]; then
+        tailscale up < /dev/tty
+    else
+        tailscale up
+    fi
 fi
 
 echo "Requesting public URL via Tailscale Funnel..."
-FUNNEL_OUT=$(tailscale funnel --bg $API_PORT 2>&1 || true)
+# timeout 6 prevents tailscale CLI from hanging forever if Funnel awaits browser authorization
+FUNNEL_OUT=$(timeout 6 tailscale funnel --bg "$API_PORT" </dev/null 2>&1 || true)
 
-if [[ "$FUNNEL_OUT" == *"login.tailscale.com"* || "$FUNNEL_OUT" == *"allow"* ]]; then
-    ACL_LINK=$(echo "$FUNNEL_OUT" | grep -o 'https://login.tailscale.com[^ ]*')
+if echo "$FUNNEL_OUT" | grep -q "login.tailscale.com" || echo "$FUNNEL_OUT" | grep -q "allow"; then
+    ACL_LINK=$(echo "$FUNNEL_OUT" | grep -o 'https://login.tailscale.com[^ ]*' | head -n1 | tr -d '[:space:]')
     
     echo -e "\n${YELLOW}============================================================${NC}"
     echo -e "${CYAN} ℹ️  INSTALLATION PAUSED - WAITING FOR YOUR ACTION  ℹ️ ${NC}"
@@ -76,43 +90,108 @@ if [[ "$FUNNEL_OUT" == *"login.tailscale.com"* || "$FUNNEL_OUT" == *"allow"* ]];
     echo -e "\n${CYAN}2. Enable/Allow the Funnel setting for this device.${NC}"
     echo -e "${YELLOW}============================================================${NC}\n"
     
-    read -p "👉 Press the [ENTER] key on your keyboard to continue... " < /dev/tty
+    if [ -r /dev/tty ]; then
+        read -r -p "👉 Press the [ENTER] key on your keyboard after enabling Funnel... " < /dev/tty
+    else
+        echo "Waiting 15 seconds for Funnel authorization..."
+        sleep 15
+    fi
     
-    tailscale funnel --bg $API_PORT > /dev/null 2>&1
+    timeout 10 tailscale funnel --bg "$API_PORT" </dev/null > /dev/null 2>&1 || true
 fi
 
-TS_DOMAIN=$(tailscale status --json | jq -r .Self.DNSName | sed 's/\.$//')
-if [ -z "$TS_DOMAIN" ] || [ "$TS_DOMAIN" == "null" ]; then
-    echo -e "${RED}[ERROR] Failed to get Tailscale domain. Ensure Funnel is authorized.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}[+] Tailscale Funnel is active on: https://${TS_DOMAIN}${NC}\n"
+TS_DOMAIN=""
+case "$SAVED_DOMAIN" in
+    ""|"null") TS_DOMAIN="" ;;
+    *) TS_DOMAIN="$SAVED_DOMAIN" ;;
+esac
+
+case "$TS_DOMAIN" in
+    ""|"null")
+        TS_DOMAIN=$(tailscale status --json 2>/dev/null | jq -r .Self.DNSName 2>/dev/null | tr -d '\r' | sed 's/\.$//' | head -n1 | tr -d '[:space:]' || true)
+        ;;
+esac
+
+case "$TS_DOMAIN" in
+    ""|"null")
+        TS_DOMAIN=$(hostname -f 2>/dev/null | tr -d '\r' | head -n1 | tr -d '[:space:]' || hostname | tr -d '\r' | head -n1 | tr -d '[:space:]' || true)
+        ;;
+esac
+
+echo -e "${GREEN}[+] Tailscale Funnel active on: https://${TS_DOMAIN}${NC}\n"
 
 # Step 3: Application Structure & API Code
 echo -e "${YELLOW}[Step 3/4] Creating secure API application and helper scripts...${NC}"
 APP_DIR="/opt/rasppi-remote"
 mkdir -p "$APP_DIR"
 
-# Safely determine the real user and their home directory
-REAL_USER="${SUDO_USER:-root}"
-USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
-if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
-    USER_HOME="/root"
+REAL_USER="${SUDO_USER:-}"
+case "$REAL_USER" in
+    "")
+        REAL_USER=$(awk -F: '$3>=1000 && $3<65534 {print $1; exit}' /etc/passwd 2>/dev/null || echo "root")
+        ;;
+esac
+REAL_USER=$(echo "$REAL_USER" | tr -d '[:space:]' | head -n1)
+case "$REAL_USER" in
+    "") REAL_USER="root" ;;
+esac
+
+USER_HOME=""
+RAW_HOME=$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 | head -n1 || true)
+USER_HOME=$(echo "$RAW_HOME" | tr -d '\r' | tr -d '[:space:]' | head -n1)
+
+case "$USER_HOME" in
+    ""|/)
+        USER_HOME="/root"
+        ;;
+    *)
+        if [ ! -d "$USER_HOME" ]; then
+            USER_HOME="/root"
+        fi
+        ;;
+esac
+
+ALIASES_FILE="$USER_HOME/.bash_aliases"
+if [ ! -f "$ALIASES_FILE" ]; then
+    cat << 'EOF_ALIASES' > "$ALIASES_FILE"
+# ============================================================
+# RaspPi-Remote (Garmin IQ) Custom Commands & Slots
+# Define your custom watch commands below using standard aliases:
+# alias custom_slot1='echo "Hello from Raspberry Pi!"'
+# ============================================================
+EOF_ALIASES
+    if [ "$USER_HOME" != "/root" ]; then
+        chown "$REAL_USER":"$REAL_USER" "$ALIASES_FILE" 2>/dev/null || true
+    fi
 fi
 
 # 1. Generate User Services script
-cat << 'EOF' > "$USER_HOME/user_services.sh"
+cat << 'EOF_SERVICES' > "$APP_DIR/user_services.sh"
 #!/bin/bash
 export LC_ALL=C
 echo "=== USER SERVICES ==="
-USER_SERVICES=$(find /etc/systemd/system -maxdepth 1 -type f -name "*.service" -printf "%f\n" 2>/dev/null | sed 's/\.service//' | sort)
-if [ -z "$USER_SERVICES" ]; then
-    echo "No custom user"
-    echo "services found."
+for f in /etc/systemd/system/*.service; do
+    [ -e "$f" ] || continue
+    fname=$(basename "$f" .service)
+    case "$fname" in
+        systemd-*|dbus*|ssh|sshd|cron|rsyslog|syslog|networking|NetworkManager*|wpa_supplicant*|avahi-daemon*|bluetooth*|triggerhappy*|ModemManager*|polkit*|udisks2*|tailscaled|rasppi-remote|docker*|containerd*|lightdm*|alsa-*|cups*|nfs-*|rpc-*|smartmontools*|e2scrub*|fstrim*|apt-*|dpkg-*|man-db*|logrotate*|getty*|serial-getty*|user@*|console-setup*|keyboard-setup*|fake-hwclock*|raspi-config*|rpi-eeprom-update*|dphys-swapfile*)
+            continue
+            ;;
+        *)
+            echo "$fname"
+            ;;
+    esac
+done | sort > /tmp/user_services_list.txt
+
+if [ ! -s /tmp/user_services_list.txt ]; then
+    echo "No custom user services found."
+    rm -f /tmp/user_services_list.txt
     exit 0
 fi
+
 COUNT_ON=0; COUNT_OFF=0; COUNT_FAIL=0
-for s in $USER_SERVICES; do
+while read -r s; do
+    [ -z "$s" ] && continue
     if systemctl is-failed --quiet "${s}.service" 2>/dev/null; then
         echo "🚨 $s"
         COUNT_FAIL=$((COUNT_FAIL + 1))
@@ -123,84 +202,93 @@ for s in $USER_SERVICES; do
         echo "🔴 $s"
         COUNT_OFF=$((COUNT_OFF + 1))
     fi
-done
+done < /tmp/user_services_list.txt
+rm -f /tmp/user_services_list.txt
 echo "-------------------"
-echo "ON: $COUNT_ON | OFF: $COUNT_OFF | ERR: $COUNT_FAIL"
-EOF
+echo "ON: $COUNT_ON | OFF: $COUNT_OFF | ERR:$COUNT_FAIL"
+EOF_SERVICES
+chmod 755 "$APP_DIR/user_services.sh"
 
-chmod 755 "$USER_HOME/user_services.sh"
-if [ "$USER_HOME" != "/root" ]; then
-    chown "$REAL_USER":"$REAL_USER" "$USER_HOME/user_services.sh" 2>/dev/null || true
+for d in /home/*; do
+    if [ -d "$d" ]; then
+        ln -sf "$APP_DIR/user_services.sh" "$d/user_services.sh"
+        chown -h "$(basename "$d")":"$(basename "$d")" "$d/user_services.sh" 2>/dev/null || true
+        
+        U_ALIAS="$d/.bash_aliases"
+        if [ ! -f "$U_ALIAS" ]; then
+            touch "$U_ALIAS"
+            chown "$(basename "$d")":"$(basename "$d")" "$U_ALIAS" 2>/dev/null || true
+        fi
+        if ! grep -q "alias userservices=" "$U_ALIAS" 2>/dev/null; then
+            echo -e "\nalias userservices='/opt/rasppi-remote/user_services.sh'" >> "$U_ALIAS"
+        fi
+    fi
+done
+
+if ! grep -q "alias userservices=" "$ALIASES_FILE" 2>/dev/null; then
+    echo -e "\nalias userservices='/opt/rasppi-remote/user_services.sh'" >> "$ALIASES_FILE"
+    if [ "$USER_HOME" != "/root" ]; then
+        chown "$REAL_USER":"$REAL_USER" "$ALIASES_FILE" 2>/dev/null || true
+    fi
 fi
 
-# 2. Generate Top Hogs script in APP_DIR
-cat << 'EOF' > "$APP_DIR/top_hogs.sh"
+# 2. Generate Top Hogs script
+cat << 'EOF_HOGS' > "$APP_DIR/top_hogs.sh"
 #!/bin/bash
 export LC_ALL=C
 echo "🔥 TOP CPU:"
-ps -eo comm,%cpu --sort=-%cpu | awk 'NR>1 && NR<=4 {printf "▪️ %-10s %s%%\n", substr($1,1,10), $2}'
+ps -eo comm,%cpu --sort=-%cpu | awk '$1 != "COMMAND" && $1 != "ps" { if(c<3) { printf "▪️ %-10s %s%%\n", substr($1,1,10), $2; c++ } }'
 echo "💻 TOP RAM:"
 ps -eo comm,%mem --sort=-%mem | awk 'NR>1 && NR<=4 {printf "▪️ %-10s %s%%\n", substr($1,1,10), $2}'
-EOF
-
+EOF_HOGS
 chmod 755 "$APP_DIR/top_hogs.sh"
 
-# 3. Prepare authentication log file
+# 3. Prepare auth log file
 touch /var/log/rasppi-remote-auth.log
 chmod 600 /var/log/rasppi-remote-auth.log
 chown root:root /var/log/rasppi-remote-auth.log
 
 # 4. Generate main Python API server
-cat << 'EOF' > "$APP_DIR/garmin_api.py"
+cat << 'EOF_PYTHON' > "$APP_DIR/garmin_api.py"
 from flask import Flask, jsonify, request
-import subprocess
-import os
-import logging
-import hmac
-import time
-import ipaddress
-import re
-import urllib.request
-import urllib.parse
+import subprocess, os, logging, hmac, time, ipaddress, re, threading, pwd, shlex
 from datetime import datetime
 from waitress import serve
 
 app = Flask(__name__)
-
-# Silence default Flask request logging to prevent token leaks in journald
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 SECURITY_TOKEN = os.environ.get('SECURITY_TOKEN', 'UNSET')
-USER_HOME = os.environ.get('USER_HOME', '/root')
-PUSHOVER_TOKEN = os.environ.get('PUSHOVER_TOKEN', '')
-PUSHOVER_USER = os.environ.get('PUSHOVER_USER', '')
 AUTH_LOG_FILE = '/var/log/rasppi-remote-auth.log'
 
-# Direct socket connections are allowed only from Localhost (Tailscale Funnel proxy), LAN, and Tailscale VPN
 ALLOWED_DIRECT_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),       # Localhost / Tailscale Funnel Proxy
-    ipaddress.ip_network("192.168.0.0/16"),    # Local LAN
-    ipaddress.ip_network("10.0.0.0/8"),        # Private LAN / VPN
-    ipaddress.ip_network("172.16.0.0/12"),     # Private LAN
-    ipaddress.ip_network("100.64.0.0/10"),     # Tailscale VPN
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("100.64.0.0/10"),
 ]
 
 MAX_FAILED_ATTEMPTS = 5
-BLOCK_TIME_SECONDS = 900  # 15 minutes ban after 5 failed attempts
-failed_attempts = {}      # {ip: [timestamps]}
+BLOCK_TIME_SECONDS = 900
+failed_attempts = {}
+rate_limit_lock = threading.Lock()
 
 COMMANDS = {
     "pi_status": """
-        echo "🍓 CPU: $(LC_ALL=C top -bn1 | grep 'Cpu(s)' | awk '{print $2+$4}')% @ $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null | awk '{print $1/1000000}' || echo 0) GHz"
-        echo "🌡️ Temp: $(vcgencmd measure_temp 2>/dev/null | grep -o '[0-9.]*')°C"
-        echo "💻 RAM: $(free -m | awk 'NR==2 {print $3}') / $(free -m | awk 'NR==2 {print $2}') MB"
-        echo "⚙️ Load: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+        CPU_USAGE=$(LC_ALL=C top -bn1 | grep 'Cpu(s)' | awk '{print $2+$4}')
+        CPU_FREQ=$(awk '{printf "%.2f", $1/1000000}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "N/A")
+        TEMP=$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null || vcgencmd measure_temp 2>/dev/null | grep -o '[0-9.]*' || echo "N/A")
+        echo "🍓 CPU: ${CPU_USAGE}% @${CPU_FREQ} GHz"
+        echo "🌡️ Temp: ${TEMP}°C"
+        echo "💻 RAM: $(free -m | awk 'NR==2 {print $3}') /$(free -m | awk 'NR==2 {print $2}') MB"
+        echo "⚙️ Load: $(awk '{print $1, $2, $3}' /proc/loadavg)"
         echo "⏱️ Up: $(uptime -p | sed 's/up //; s/ days/d/; s/ day/d/; s/ hours/hrs/; s/ hour/hr/; s/ minutes/min/; s/ minute/min/')"
-        echo "🔥 Top: $(ps -eo comm,%cpu --sort=-%cpu | head -n 2 | tail -n 1 | awk '{print $1, $2"%"}' )"
-        echo "👤 SSH: $(who | wc -l) online"
+        echo "🔥 Top: $(ps -eo comm,%cpu --sort=-%cpu | awk 'NR==2 {print $1, $2"%"}')"
+        echo "👤 SSH: $(ss -tn state established '( sport = :22 )' | tail -n +2 | wc -l) online"
     """.strip(),
-    "disk_space": r"""df -h | grep "^/dev/" | grep -v "/boot" | while read -r fs size used avail pcent mount; do rdev=$(findmnt -n -o SOURCE "$mount" 2>/dev/null || echo "$fs"); rtype=$(lsblk -no FSTYPE "$rdev" 2>/dev/null | grep -v "^$" | head -n1); [ -z "$rtype" ] && rtype=$(findmnt -n -o FSTYPE "$mount" 2>/dev/null); printf "💾 %s (%s):\n🔴 Used: %s (%s/%s)\n🟢 Free: %s\n📁 System: %s\n" "$mount" "${rdev#/dev/}" "$pcent" "$used" "$size" "$avail" "${rtype:-unknown}"; done""",
+    "disk_space": r"""df -h | grep "^/dev/" | grep -Ev "/boot|/efi" | while read -r fs size used avail pcent mount; do rdev=$(findmnt -n -o SOURCE "$mount" 2>/dev/null || echo "$fs"); rtype=$(lsblk -no FSTYPE "$rdev" 2>/dev/null | grep -v "^$" | head -n1); [ -z "$rtype" ] && rtype=$(findmnt -n -o FSTYPE "$mount" 2>/dev/null); printf "💾 %s (%s):\n🔴 Used: %s (%s/%s)\n🟢 Free: %s\n📁 System: %s\n" "$mount" "${rdev#/dev/}" "$pcent" "$used" "$size" "$avail" "${rtype:-unknown}"; done""",
     "system_shield": """
         SSH_F=$(journalctl -u ssh -u sshd --since today --no-pager 2>/dev/null | grep -i 'failed' | wc -l)
         TODAY=$(date +%Y-%m-%d)
@@ -229,7 +317,7 @@ COMMANDS = {
             systemctl --failed --type=service --no-legend | awk '{print "▪️ "$1}' | sed 's/.service//' | head -n 3
         fi
     """.strip(),
-    "userservices": f"{USER_HOME}/user_services.sh",
+    "userservices": "/opt/rasppi-remote/user_services.sh",
     "docker_status": """
         if ! command -v docker &> /dev/null; then
             echo "🐳 Docker not installed"
@@ -244,7 +332,7 @@ COMMANDS = {
             exit 0
         fi
         STOP=$((ALL - RUN))
-        echo "🐳 ON: $RUN | OFF: $STOP"
+        echo "🐳 ON: $RUN | OFF:$STOP"
         echo "-------------------"
         [ "$RUN" -gt 0 ] && docker ps --format "🟢 {{.Names}}" | head -n 6
         [ "$STOP" -gt 0 ] && docker ps -f "status=exited" --format "🔴 {{.Names}}" | head -n 4
@@ -252,33 +340,44 @@ COMMANDS = {
     """.strip(),
     "top_hogs": "/opt/rasppi-remote/top_hogs.sh",
     "net_info": """
-        LAN_IP=$(hostname -I | awk '{print $1}')
-        TS_IP=$(tailscale ip -4 2>/dev/null | head -n1)
-        PING_MS=$(ping -c 1 -W 2 1.1.1.1 2>/dev/null | awk -F'/' 'END{print $5}')
-        WIFI_SIG=$(awk 'NR==3 {print int($3 * 100 / 70)"%"}' /proc/net/wireless 2>/dev/null)
-        
-        echo "🏠 LAN: ${LAN_IP:-Disconnected}"
-        echo "🔒 VPN: ${TS_IP:-Offline}"
-        if [ -n "$WIFI_SIG" ]; then
-            echo "📶 WiFi Signal: $WIFI_SIG"
-        else
-            echo "🔌 Net: Ethernet"
-        fi
-        if [ -n "$PING_MS" ]; then
-            echo "⚡ Ping: ${PING_MS} ms"
-        else
-            echo "❌ Ping: Offline"
-        fi
-        RX_GB=$(awk '/eth0|wlan0|end0/ {rx+=$2} END {printf "%.1f GB", rx/1024/1024/1024}' /proc/net/dev)
-        echo "📥 RX Total: $RX_GB"
+        net_info() {
+            local LAN_IP TS_IP PING_MS WIFI_SIG NM_SIG DBM RX_GB;
+            LAN_IP=$(hostname -I | awk '{print $1}');
+            TS_IP=$(tailscale ip -4 2> /dev/null | head -n1);
+            PING_MS=$(ping -c 1 -W 2 1.1.1.1 2> /dev/null | awk -F'/' 'END{print $5}');
+            WIFI_SIG=$(awk 'NR==3 {print int($3 * 100 / 70)"%"}' /proc/net/wireless 2> /dev/null);
+            if [ -z "$WIFI_SIG" ] && command -v nmcli &> /dev/null; then
+                NM_SIG=$(nmcli -t -f IN-USE,SIGNAL dev wifi 2>/dev/null | grep '^\\*' | cut -d: -f2 | head -n1);
+                [ -n "$NM_SIG" ] && WIFI_SIG="${NM_SIG}%";
+            fi;
+            if [ -z "$WIFI_SIG" ] && command -v iw &> /dev/null; then
+                DBM=$(iw dev wlan0 link 2>/dev/null | awk '/signal:/ {print $2}');
+                if [ -n "$DBM" ]; then
+                    WIFI_SIG=$(awk -v dbm="$DBM" 'BEGIN { sig = 2 * (dbm + 100); if (sig > 100) sig = 100; if (sig < 0) sig = 0; printf "%d%%", sig }');
+                fi;
+            fi;
+            echo "🏠 LAN: ${LAN_IP:-Disconnected}";
+            echo "🔒 VPN: ${TS_IP:-Offline}";
+            if [ -n "$WIFI_SIG" ]; then
+                echo "📶 WiFi Signal: $WIFI_SIG";
+            else
+                echo "🔌 Net: Ethernet";
+            fi;
+            if [ -n "$PING_MS" ]; then
+                echo "⚡ Ping: ${PING_MS} ms";
+            else
+                echo "❌ Ping: Offline";
+            fi;
+            RX_GB=$(awk 'NR>2 && $1 !~ /^(lo|docker|veth|br-|tailscale)/ {rx+=$2} END {printf "%.1f GB", rx/1024/1024/1024}' /proc/net/dev);
+            echo "📥 RX Total: $RX_GB";
+        }
+        net_info
     """.strip(),
     "reboot_pi": "( sleep 3 && sudo reboot ) >/dev/null 2>&1 &"
 }
 
-# Dynamically populate custom_slot1 through custom_slot30
 for i in range(1, 31):
     COMMANDS[f"custom_slot{i}"] = f"printf 'ℹ️ Custom Slot {i}\\nConfigure in ~/.bash_aliases'"
-
 
 def is_direct_ip_allowed(ip_str):
     try:
@@ -287,16 +386,13 @@ def is_direct_ip_allowed(ip_str):
     except ValueError:
         return False
 
-
 def get_real_client_ip():
     remote_ip = request.remote_addr or "0.0.0.0"
-    # If request comes through local Tailscale Funnel proxy (127.0.0.1), inspect X-Forwarded-For
     if remote_ip == "127.0.0.1":
         forwarded = request.headers.get("X-Forwarded-For", "")
         if forwarded:
             return forwarded.split(",")[0].strip()
     return remote_ip
-
 
 def log_and_alert(ip_addr, reason):
     try:
@@ -306,33 +402,24 @@ def log_and_alert(ip_addr, reason):
     except Exception:
         pass
 
-    if PUSHOVER_TOKEN and PUSHOVER_USER:
-        try:
-            data = urllib.parse.urlencode({
-                "token": PUSHOVER_TOKEN,
-                "user": PUSHOVER_USER,
-                "message": f"🚨 RaspPi-Remote Security Alert!\nIP: {ip_addr}\n{reason}",
-                "priority": 1
-            }).encode("utf-8")
-            req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
-            urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass
-
-
 def check_rate_limit(ip_str):
     now = time.time()
-    attempts = [t for t in failed_attempts.get(ip_str, []) if now - t < BLOCK_TIME_SECONDS]
-    failed_attempts[ip_str] = attempts
-    return len(attempts) < MAX_FAILED_ATTEMPTS
-
+    with rate_limit_lock:
+        for k in list(failed_attempts.keys()):
+            valid = [t for t in failed_attempts[k] if now - t < BLOCK_TIME_SECONDS]
+            if valid:
+                failed_attempts[k] = valid
+            else:
+                del failed_attempts[k]
+        return len(failed_attempts.get(ip_str, [])) < MAX_FAILED_ATTEMPTS
 
 def record_failed_attempt(ip_str):
     now = time.time()
-    attempts = failed_attempts.setdefault(ip_str, [])
-    attempts.append(now)
-    log_and_alert(ip_str, f"Invalid token attempt ({len(attempts)}/{MAX_FAILED_ATTEMPTS})")
-
+    with rate_limit_lock:
+        attempts = failed_attempts.setdefault(ip_str, [])
+        attempts.append(now)
+        count = len(attempts)
+    log_and_alert(ip_str, f"Invalid token attempt ({count}/{MAX_FAILED_ATTEMPTS})")
 
 def verify_token_safe(action_with_token):
     if SECURITY_TOKEN == 'UNSET' or len(action_with_token) <= len(SECURITY_TOKEN):
@@ -341,7 +428,6 @@ def verify_token_safe(action_with_token):
     if hmac.compare_digest(provided_token, SECURITY_TOKEN):
         return action_with_token[:-len(SECURITY_TOKEN)]
     return None
-
 
 def get_system_aliases():
     aliases = {}
@@ -357,10 +443,14 @@ def get_system_aliases():
     for filepath in files_to_check:
         if os.path.exists(filepath):
             try:
+                file_owner = pwd.getpwuid(os.stat(filepath).st_uid).pw_name
+            except Exception:
+                file_owner = 'root'
+
+            try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     for line in f:
                         line = line.strip()
-                        # 1. Classic aliases: alias name='command'
                         if line.startswith("alias "):
                             try:
                                 declaration = line[6:].strip()
@@ -369,36 +459,36 @@ def get_system_aliases():
                                     name = name.strip()
                                     cmd = cmd.strip()
                                     if len(cmd) >= 2 and cmd[0] in ("'", '"') and cmd[-1] == cmd[0]:
+                                        quote_char = cmd[0]
                                         cmd = cmd[1:-1]
-                                    aliases[name] = cmd
+                                        if quote_char == '"':
+                                            cmd = cmd.replace('\\$', '$').replace('\\"', '"').replace('\\`', '`').replace('\\\\', '\\')
+                                    aliases[name] = {"cmd": cmd, "owner": file_owner}
                             except Exception:
                                 pass
-                        # 2. Bash functions: name() or function name()
                         elif not line.startswith("#"):
                             m = re.match(r'^(?:function\s+)?([a-zA-Z0-9_-]+)\s*\(\s*\)', line)
                             if m:
                                 func_name = m.group(1)
-                                aliases[func_name] = f"eval \"$(sed '/^case \\$- in/,/esac/d' {filepath})\" >/dev/null 2>&1 && {func_name}"
+                                aliases[func_name] = {
+                                    "cmd": f"source {filepath} >/dev/null 2>&1 && {func_name}",
+                                    "owner": file_owner
+                                }
             except Exception:
                 pass
     return aliases
 
-
 @app.before_request
 def security_gate():
-    # 1. Block direct non-private connections bypassing Tailscale Funnel
     if not is_direct_ip_allowed(request.remote_addr):
         return jsonify({"status": "error", "wykonano": None, "output": "ERROR:\nForbidden Direct IP"}), 403
-    # 2. Check brute-force rate limit for the real client IP
     client_ip = get_real_client_ip()
     if not check_rate_limit(client_ip):
         return jsonify({"status": "error", "wykonano": None, "output": "ERROR:\nToo Many Attempts"}), 429
 
-
 @app.route('/api/status', methods=['GET'])
 def status():
     return jsonify({"status": "success", "wykonano": "status"}), 200
-
 
 @app.route('/api/run/<path:action_with_token>', methods=['GET'])
 def run_command(action_with_token):
@@ -412,13 +502,16 @@ def run_command(action_with_token):
     system_aliases = get_system_aliases()
 
     cmd = None
+    run_as_user = "root"
+
     if action in system_aliases:
-        cmd = system_aliases[action]
-        # Prevent continuous log streams (-f) from hanging the API thread
+        cmd = system_aliases[action]["cmd"]
+        run_as_user = system_aliases[action]["owner"]
         if "journalctl" in cmd or "tail " in cmd:
             cmd = re.sub(r'\s+-f(\s+|$)', ' --no-pager ', cmd)
     elif action in COMMANDS:
         cmd = COMMANDS[action]
+        run_as_user = "root"
     else:
         return jsonify({"status": "error", "wykonano": None, "output": f"ERROR:\nUnknown action: {action}"}), 404
 
@@ -432,19 +525,38 @@ def run_command(action_with_token):
             cmd.strip().endswith("&")
         )
 
+        clean_cmd = cmd.strip()
+        if clean_cmd.endswith("&"):
+            clean_cmd = clean_cmd[:-1].strip()
+
+        if run_as_user != "root" and not clean_cmd.startswith("su "):
+            clean_cmd = f"sudo -u {shlex.quote(run_as_user)} -i bash -c {shlex.quote(clean_cmd)}"
+
         if is_async:
-            clean_cmd = cmd.strip()
-            if clean_cmd.endswith("&"):
-                clean_cmd = clean_cmd[:-1].strip()
-                
-            subprocess.Popen(clean_cmd, shell=True, executable='/bin/bash', start_new_session=True)
+            subprocess.Popen(
+                clean_cmd,
+                shell=True,
+                executable='/bin/bash',
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
             return jsonify({
                 "status": "success", 
                 "wykonano": action, 
                 "output": f"Action '{action}'\nstarted in background."
             }), 200
         else:
-            result = subprocess.run(cmd, shell=True, executable='/bin/bash', capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                clean_cmd,
+                shell=True,
+                executable='/bin/bash',
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
             output = result.stdout.strip()
             error_output = result.stderr.strip()
             
@@ -464,33 +576,41 @@ def run_command(action_with_token):
 if __name__ == '__main__':
     port = int(os.environ.get('API_PORT', 8080))
     serve(app, host='0.0.0.0', port=port)
-EOF
+EOF_PYTHON
 
-# Set strict and functional permissions
 chown -R root:root "$APP_DIR"
-chmod 755 "$APP_DIR"
-chmod 755 "$APP_DIR/top_hogs.sh"
+chmod 755 "$APP_DIR" "$APP_DIR/user_services.sh" "$APP_DIR/top_hogs.sh"
 chmod 600 "$APP_DIR/garmin_api.py"
-echo -e "${GREEN}[+] API files and helper scripts generated securely.${NC}\n"
 
-# Step 4: System Services
-echo -e "${YELLOW}[Step 4/4] Configuring background services...${NC}"
-
-if systemctl is-active --quiet rasppi-cf-tunnel.service 2>/dev/null; then
-    systemctl stop rasppi-cf-tunnel.service 2>/dev/null || true
-    systemctl disable rasppi-cf-tunnel.service 2>/dev/null || true
-    rm -f /etc/systemd/system/rasppi-cf-tunnel.service
+# 5. Create CLI helper tool 'rasppi-remote'
+cat << 'EOF_CLI' > /usr/local/bin/rasppi-remote
+#!/bin/bash
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run with sudo: sudo rasppi-remote"
+    exit 1
 fi
+. /etc/default/rasppi-remote 2>/dev/null || true
+echo "============================================================"
+echo "   RaspPi-Remote Admin (Garmin IQ) - Connection Details     "
+echo "============================================================"
+echo "1. Server URL:  https://${TS_DOMAIN}/api/run/"
+echo "2. Token:       ${SECURITY_TOKEN}"
+echo "3. Service:     $(systemctl is-active rasppi-remote.service)"
+echo "4. Aliases:     ${USER_HOME}/.bash_aliases"
+echo "============================================================"
+EOF_CLI
+chmod 755 /usr/local/bin/rasppi-remote
 
-cat << EOF > /etc/default/rasppi-remote
+cat << EOF_ENV > /etc/default/rasppi-remote
 SECURITY_TOKEN=$SECRET_TOKEN
 API_PORT=$API_PORT
 USER_HOME=$USER_HOME
-EOF
+TS_DOMAIN=$TS_DOMAIN
+EOF_ENV
 chmod 600 /etc/default/rasppi-remote
 chown root:root /etc/default/rasppi-remote
 
-cat << 'EOF' > /etc/systemd/system/rasppi-remote.service
+cat << 'EOF_SERVICE' > /etc/systemd/system/rasppi-remote.service
 [Unit]
 Description=RaspPi Remote Garmin API
 Wants=network-online.target tailscaled.service
@@ -503,33 +623,22 @@ WorkingDirectory=/opt/rasppi-remote
 Restart=always
 RestartSec=3
 User=root
+MemoryMax=128M
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_SERVICE
 
 chmod 644 /etc/systemd/system/rasppi-remote.service
 systemctl daemon-reload
 systemctl enable rasppi-remote.service > /dev/null 2>&1
 systemctl restart rasppi-remote.service
 
-if ! systemctl is-active --quiet rasppi-remote.service; then
-    echo -e "${RED}[ERROR] Service failed to start. Check 'systemctl status rasppi-remote.service'${NC}"
-    exit 1
-fi
-echo -e "${GREEN}[+] Service configured and running.${NC}\n"
-
-# Step 5: Finalization and Credentials
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${GREEN}                  ✅ INSTALLATION COMPLETE! ✅                  ${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo -e "Your secure server is now active and protected by Tailscale."
+echo -e "\n============================================================"
+echo -e "            ✅ INSTALLATION COMPLETE! ✅                    "
+echo -e "============================================================"
+echo -e "Server URL: https://${TS_DOMAIN}/api/run/"
+echo -e "Token:      ${SECRET_TOKEN}"
 echo -e ""
-echo -e "1. Server URL:  ${YELLOW}https://${TS_DOMAIN}/api/run/${NC}"
-echo -e "2. Token:       ${YELLOW}${SECRET_TOKEN}${NC}"
-echo -e ""
-echo -e "${CYAN}>> COPY BOTH OF THESE VALUES TO YOUR GARMIN CONNECT APP <<${NC}"
-echo -e "The 8 default commands (pi_status, disk_space, system_shield, userservices,"
-echo -e "docker_status, top_hogs, net_info, reboot_pi) + custom slots (1-30)"
-echo -e "are already configured and ready to use out of the box!"
-echo -e "${CYAN}============================================================${NC}"
+echo -e "Tip: Run 'sudo rasppi-remote' anytime to view credentials."
+echo -e "============================================================"
