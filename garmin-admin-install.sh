@@ -25,14 +25,31 @@ if ! ping -c 1 -W 3 8.8.8.8 &> /dev/null && ! ping -c 1 -W 3 1.1.1.1 &> /dev/nul
 fi
 echo -e "${GREEN}[+] Internet connection is OK.${NC}\n"
 
-API_PORT=${API_PORT:-8080}
+# Step 1: Install Dependencies
+echo -e "${YELLOW}[Step 1/4] Installing system dependencies...${NC}"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq > /dev/null 2>&1
+apt-get install -y -qq sudo python3 python3-flask python3-waitress curl jq procps iproute2 iw util-linux coreutils > /dev/null 2>&1
+echo -e "${GREEN}[+] Dependencies installed successfully.${NC}\n"
+
+# Stop service if already running to free up its port before checking
+systemctl stop rasppi-remote.service 2>/dev/null || true
 
 SAVED_DOMAIN=""
 SECRET_TOKEN=""
+SAVED_PORT=""
 if [ -f /etc/default/rasppi-remote ]; then
     SECRET_TOKEN=$(grep "^SECURITY_TOKEN=" /etc/default/rasppi-remote 2>/dev/null | tr -d '\r' | cut -d'=' -f2- | head -n1 | tr -d '[:space:]' || true)
     SAVED_DOMAIN=$(grep "^TS_DOMAIN=" /etc/default/rasppi-remote 2>/dev/null | tr -d '\r' | cut -d'=' -f2- | head -n1 | tr -d '[:space:]' || true)
+    SAVED_PORT=$(grep "^API_PORT=" /etc/default/rasppi-remote 2>/dev/null | tr -d '\r' | cut -d'=' -f2- | head -n1 | tr -d '[:space:]' || true)
 fi
+
+API_PORT=${API_PORT:-${SAVED_PORT:-8081}}
+
+# Verify if port is free; if occupied by another service, find the next available port
+while ss -tulpn 2>/dev/null | grep -q ":${API_PORT} "; do
+    API_PORT=$((API_PORT + 1))
+done
 
 case "$SECRET_TOKEN" in
     ""|"UNSET")
@@ -47,13 +64,6 @@ esac
 echo -e "${GREEN}[+] Automated configuration:${NC}"
 echo -e "    - Internal Port: ${YELLOW}$API_PORT${NC}"
 echo -e "    - ${TOKEN_MSG}\n"
-
-# Step 1: Install Dependencies
-echo -e "${YELLOW}[Step 1/4] Installing system dependencies...${NC}"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq > /dev/null 2>&1
-apt-get install -y -qq sudo python3 python3-flask python3-waitress curl jq procps iproute2 iw util-linux coreutils > /dev/null 2>&1
-echo -e "${GREEN}[+] Dependencies installed successfully.${NC}\n"
 
 # Step 2: Tailscale & Funnel Authorization
 echo -e "${YELLOW}[Step 2/4] Setting up Tailscale & Funnel...${NC}"
@@ -73,7 +83,10 @@ if ! tailscale status &> /dev/null; then
     fi
 fi
 
-echo "Requesting public URL via Tailscale Funnel..."
+echo "Configuring Tailscale Funnel..."
+# Reset existing serve/funnel config to prevent 'listener already exists' errors
+tailscale serve reset > /dev/null 2>&1 || true
+
 # timeout 6 prevents tailscale CLI from hanging forever if Funnel awaits browser authorization
 FUNNEL_OUT=$(timeout 6 tailscale funnel --bg "$API_PORT" </dev/null 2>&1 || true)
 
@@ -81,7 +94,7 @@ if echo "$FUNNEL_OUT" | grep -q "login.tailscale.com" || echo "$FUNNEL_OUT" | gr
     ACL_LINK=$(echo "$FUNNEL_OUT" | grep -o 'https://login.tailscale.com[^ ]*' | head -n1 | tr -d '[:space:]')
     
     echo -e "\n${YELLOW}============================================================${NC}"
-    echo -e "${CYAN} ℹ️  INSTALLATION PAUSED - WAITING FOR YOUR ACTION  ℹ️ ${NC}"
+    echo -e "${CYAN} [i]  INSTALLATION PAUSED - WAITING FOR YOUR ACTION  [i] ${NC}"
     echo -e "${YELLOW}============================================================${NC}"
     echo -e "To make your Raspberry Pi securely accessible to your watch,"
     echo -e "you must allow 'Funnel' in your Tailscale account."
@@ -91,12 +104,13 @@ if echo "$FUNNEL_OUT" | grep -q "login.tailscale.com" || echo "$FUNNEL_OUT" | gr
     echo -e "${YELLOW}============================================================${NC}\n"
     
     if [ -r /dev/tty ]; then
-        read -r -p "👉 Press the [ENTER] key on your keyboard after enabling Funnel... " < /dev/tty
+        read -r -p "-> Press the [ENTER] key on your keyboard after enabling Funnel... " < /dev/tty
     else
         echo "Waiting 15 seconds for Funnel authorization..."
         sleep 15
     fi
     
+    tailscale serve reset > /dev/null 2>&1 || true
     timeout 10 tailscale funnel --bg "$API_PORT" </dev/null > /dev/null 2>&1 || true
 fi
 
@@ -118,7 +132,7 @@ case "$TS_DOMAIN" in
         ;;
 esac
 
-echo -e "${GREEN}[+] Tailscale Funnel active on: https://${TS_DOMAIN}${NC}\n"
+echo -e "${GREEN}[+] Tailscale Funnel active on: https://${TS_DOMAIN} (proxy -> 127.0.0.1:${API_PORT})${NC}\n"
 
 # Step 3: Application Structure & API Code
 echo -e "${YELLOW}[Step 3/4] Creating secure API application and helper scripts...${NC}"
@@ -198,6 +212,9 @@ while read -r s; do
     elif systemctl is-active --quiet "${s}.service" 2>/dev/null; then
         echo "🟢 $s"
         COUNT_ON=$((COUNT_ON + 1))
+    elif [ -f "/etc/systemd/system/${s}.timer" ] && systemctl is-active --quiet "${s}.timer" 2>/dev/null; then
+        echo "🟢 $s"
+        COUNT_ON=$((COUNT_ON + 1))
     else
         echo "🔴 $s"
         COUNT_OFF=$((COUNT_OFF + 1))
@@ -205,7 +222,7 @@ while read -r s; do
 done < /tmp/user_services_list.txt
 rm -f /tmp/user_services_list.txt
 echo "-------------------"
-echo "ON: $COUNT_ON | OFF: $COUNT_OFF | ERR:$COUNT_FAIL"
+echo "ON: $COUNT_ON | OFF: $COUNT_OFF | ERR: $COUNT_FAIL"
 EOF_SERVICES
 chmod 755 "$APP_DIR/user_services.sh"
 
@@ -332,7 +349,7 @@ COMMANDS = {
             exit 0
         fi
         STOP=$((ALL - RUN))
-        echo "🐳 ON: $RUN | OFF:$STOP"
+        echo "🐳 ON: $RUN | OFF: $STOP"
         echo "-------------------"
         [ "$RUN" -gt 0 ] && docker ps --format "🟢 {{.Names}}" | head -n 6
         [ "$STOP" -gt 0 ] && docker ps -f "status=exited" --format "🔴 {{.Names}}" | head -n 4
@@ -471,7 +488,7 @@ def get_system_aliases():
                             if m:
                                 func_name = m.group(1)
                                 aliases[func_name] = {
-                                    "cmd": f"source {filepath} >/dev/null 2>&1 && {func_name}",
+                                    "cmd": f"eval \"$(sed '/^case \\$- in/,/esac/d' {filepath})\" >/dev/null 2>&1 && {func_name}",
                                     "owner": file_owner
                                 }
             except Exception:
@@ -530,7 +547,7 @@ def run_command(action_with_token):
             clean_cmd = clean_cmd[:-1].strip()
 
         if run_as_user != "root" and not clean_cmd.startswith("su "):
-            clean_cmd = f"sudo -u {shlex.quote(run_as_user)} -i bash -c {shlex.quote(clean_cmd)}"
+            clean_cmd = f"sudo -u {shlex.quote(run_as_user)} bash -c {shlex.quote(clean_cmd)}"
 
         if is_async:
             subprocess.Popen(
@@ -574,7 +591,7 @@ def run_command(action_with_token):
         return jsonify({"status": "error", "wykonano": None, "output": f"ERROR:\n{str(e)}"}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('API_PORT', 8080))
+    port = int(os.environ.get('API_PORT', 8081))
     serve(app, host='0.0.0.0', port=port)
 EOF_PYTHON
 
@@ -595,8 +612,9 @@ echo "   RaspPi-Remote Admin (Garmin IQ) - Connection Details     "
 echo "============================================================"
 echo "1. Server URL:  https://${TS_DOMAIN}/api/run/"
 echo "2. Token:       ${SECURITY_TOKEN}"
-echo "3. Service:     $(systemctl is-active rasppi-remote.service)"
-echo "4. Aliases:     ${USER_HOME}/.bash_aliases"
+echo "3. Internal:    http://127.0.0.1:${API_PORT}"
+echo "4. Service:     $(systemctl is-active rasppi-remote.service)"
+echo "5. Aliases:     ${USER_HOME}/.bash_aliases"
 echo "============================================================"
 EOF_CLI
 chmod 755 /usr/local/bin/rasppi-remote
@@ -635,7 +653,7 @@ systemctl enable rasppi-remote.service > /dev/null 2>&1
 systemctl restart rasppi-remote.service
 
 echo -e "\n============================================================"
-echo -e "            ✅ INSTALLATION COMPLETE! ✅                    "
+echo -e "            [+] INSTALLATION COMPLETE! [+]                  "
 echo -e "============================================================"
 echo -e "Server URL: https://${TS_DOMAIN}/api/run/"
 echo -e "Token:      ${SECRET_TOKEN}"
