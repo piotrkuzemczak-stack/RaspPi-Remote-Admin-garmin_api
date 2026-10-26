@@ -8,7 +8,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}    RaspPi-Remote Admin (Garmin IQ) - Server Setup Script${NC}"
+echo -e "${CYAN}   RaspPi-Remote Admin (Garmin IQ) - Server Setup Script${NC}"
 echo -e "${CYAN}============================================================${NC}"
 echo ""
 
@@ -29,7 +29,7 @@ echo -e "${GREEN}[+] Internet connection is OK.${NC}\n"
 echo -e "${YELLOW}[Step 1/4] Installing system dependencies...${NC}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq > /dev/null 2>&1
-apt-get install -y -qq sudo python3 python3-flask python3-waitress curl jq procps iproute2 iw util-linux coreutils > /dev/null 2>&1
+apt-get install -y -qq sudo python3 python3-flask python3-waitress curl jq procps iproute2 iw util-linux coreutils i2c-tools gpiod > /dev/null 2>&1
 echo -e "${GREEN}[+] Dependencies installed successfully.${NC}\n"
 
 # Stop service if already running to free up its port before checking
@@ -226,29 +226,6 @@ echo "ON: $COUNT_ON | OFF: $COUNT_OFF | ERR: $COUNT_FAIL"
 EOF_SERVICES
 chmod 755 "$APP_DIR/user_services.sh"
 
-for d in /home/*; do
-    if [ -d "$d" ]; then
-        ln -sf "$APP_DIR/user_services.sh" "$d/user_services.sh"
-        chown -h "$(basename "$d")":"$(basename "$d")" "$d/user_services.sh" 2>/dev/null || true
-        
-        U_ALIAS="$d/.bash_aliases"
-        if [ ! -f "$U_ALIAS" ]; then
-            touch "$U_ALIAS"
-            chown "$(basename "$d")":"$(basename "$d")" "$U_ALIAS" 2>/dev/null || true
-        fi
-        if ! grep -q "alias userservices=" "$U_ALIAS" 2>/dev/null; then
-            echo -e "\nalias userservices='/opt/rasppi-remote/user_services.sh'" >> "$U_ALIAS"
-        fi
-    fi
-done
-
-if ! grep -q "alias userservices=" "$ALIASES_FILE" 2>/dev/null; then
-    echo -e "\nalias userservices='/opt/rasppi-remote/user_services.sh'" >> "$ALIASES_FILE"
-    if [ "$USER_HOME" != "/root" ]; then
-        chown "$REAL_USER":"$REAL_USER" "$ALIASES_FILE" 2>/dev/null || true
-    fi
-fi
-
 # 2. Generate Top Hogs script
 cat << 'EOF_HOGS' > "$APP_DIR/top_hogs.sh"
 #!/bin/bash
@@ -260,12 +237,141 @@ ps -eo comm,%mem --sort=-%mem | awk 'NR>1 && NR<=4 {printf "▪️ %-10s %s%%\n"
 EOF_HOGS
 chmod 755 "$APP_DIR/top_hogs.sh"
 
-# 3. Prepare auth log file
+# 3. Generate GPIO Scan script
+cat << 'EOF_GPIOSCAN' > "$APP_DIR/gpio_scan.sh"
+#!/bin/bash
+echo "=== 🔍 GPIO & I2C ==="
+echo "[I2C BUS]"
+if command -v i2cdetect > /dev/null 2>&1; then
+    i2cdetect -y 1 2> /dev/null | awk '
+    NR>1 {
+        row = substr($1, 1, 1);
+        for(i=2; i<=NF; i++) {
+            if ($i ~ /^[0-9a-f]{2}$/) {
+                printf "_GRN_ 0x%s (Active)\n", row sprintf("%x", i-2);
+            } else if ($i == "UU") {
+                printf "_LCK_ 0x%s (Kernel)\n", row sprintf("%x", i-2);
+            }
+        }
+    }' | sed -e 's/_GRN_/🟢/' -e 's/_LCK_/🔒/' | grep . || echo "⚪ No I2C devices"
+else
+    echo "⚪ i2c-tools missing"
+fi
+echo "[PARKED PINS]"
+if command -v gpioinfo > /dev/null 2>&1; then
+    gpioinfo 2> /dev/null | awk '
+    /line/ && (/used/ || /consumer=/) && $0 ~ /GPIO[0-9]+/ {
+        match($0, /GPIO[0-9]+/); pin = substr($0, RSTART+4, RLENGTH-4);
+        dir = ($0 ~ /output/) ? "O" : "I";
+        consumer = "";
+        if (match($0, /consumer="[^"]+"/)) { consumer = substr($0, RSTART+10, RLENGTH-11); }
+        else if (match($0, /: "[^"]+"/)) { consumer = substr($0, RSTART+3, RLENGTH-4); }
+
+        if (consumer != "" && consumer !~ /^(unused|shutdown|pwr_led|act_led|eth_|pcie|spi0 CS|cam|vc4|scl|sda)/) {
+            printf "_PIN_ G%-2s[%s] %s\n", pin, dir, substr(consumer, 1, 11)
+        }
+    }' | sed 's/_PIN_/📌/' | grep . || echo "⚪ All user pins free"
+else
+    echo "⚪ gpiod missing"
+fi
+EOF_GPIOSCAN
+chmod 755 "$APP_DIR/gpio_scan.sh"
+
+# 4. Generate System Updates & Upgrade scripts
+cat << 'EOF_SYSUPDATES' > "$APP_DIR/system_updates.sh"
+#!/bin/bash
+export LC_ALL=C
+echo "📦 SYSTEM UPDATES"
+if fuser /var/lib/dpkg/lock-frontend > /dev/null 2>&1; then
+    echo "⏳ Apt is busy..."
+    echo "System is updating"
+    exit 0
+fi
+COUNT=$(apt-get -s upgrade 2> /dev/null | awk '/^[0-9]+ upgraded,/ {print $1}')
+if [ -z "$COUNT" ] || [ "$COUNT" -eq 0 ]; then
+    echo "✅ All up to date!"
+    echo "🛡️ System secure"
+else
+    echo "⚠️ $COUNT pkgs ready"
+    SEC=$(apt-get -s upgrade 2> /dev/null | grep -i "security" | grep -i "Inst" | wc -l || echo 0)
+    if [ "$SEC" -gt 0 ]; then
+        echo "🚨 $SEC sec patches!"
+    fi
+    echo "💻 Use sys_upgrade"
+fi
+EOF_SYSUPDATES
+chmod 755 "$APP_DIR/system_updates.sh"
+
+cat << 'EOF_SYSUPGRADE' > "$APP_DIR/system_upgrade.sh"
+#!/bin/bash
+export LC_ALL=C
+echo "🚀 Upgrade started..."
+echo "Working in background."
+(
+    while fuser /var/lib/dpkg/lock-frontend > /dev/null 2>&1; do sleep 5; done
+    LOG="/tmp/sys_upgrade.log"
+    sudo apt-get update -qq > /dev/null 2>&1
+    sudo apt-get upgrade -y > "$LOG" 2>&1
+) &
+EOF_SYSUPGRADE
+chmod 755 "$APP_DIR/system_upgrade.sh"
+
+
+# Link helper scripts & aliases to user profiles
+for d in /home/*; do
+    if [ -d "$d" ]; then
+        ln -sf "$APP_DIR/user_services.sh" "$d/user_services.sh"
+        chown -h "$(basename "$d")":"$(basename "$d")" "$d/user_services.sh" 2>/dev/null || true
+        
+        U_ALIAS="$d/.bash_aliases"
+        if [ ! -f "$U_ALIAS" ]; then
+            touch "$U_ALIAS"
+            chown "$(basename "$d")":"$(basename "$d")" "$U_ALIAS" 2>/dev/null || true
+        fi
+        
+        sed -i '/gpio_reset/d' "$U_ALIAS" 2>/dev/null || true
+        
+        if ! grep -q "alias userservices=" "$U_ALIAS" 2>/dev/null; then
+            echo -e "\nalias userservices='/opt/rasppi-remote/user_services.sh'" >> "$U_ALIAS"
+        fi
+        if ! grep -q "alias gpio_scan=" "$U_ALIAS" 2>/dev/null; then
+            echo "alias gpio_scan='/opt/rasppi-remote/gpio_scan.sh'" >> "$U_ALIAS"
+        fi
+        if ! grep -q "alias system_updates=" "$U_ALIAS" 2>/dev/null; then
+            echo "alias system_updates='/opt/rasppi-remote/system_updates.sh'" >> "$U_ALIAS"
+        fi
+        if ! grep -q "alias system_upgrade=" "$U_ALIAS" 2>/dev/null; then
+            echo "alias system_upgrade='/opt/rasppi-remote/system_upgrade.sh'" >> "$U_ALIAS"
+            echo "alias sys_upgrade='/opt/rasppi-remote/system_upgrade.sh'" >> "$U_ALIAS"
+        fi
+    fi
+done
+
+sed -i '/gpio_reset/d' "$ALIASES_FILE" 2>/dev/null || true
+if ! grep -q "alias userservices=" "$ALIASES_FILE" 2>/dev/null; then
+    echo -e "\nalias userservices='/opt/rasppi-remote/user_services.sh'" >> "$ALIASES_FILE"
+fi
+if ! grep -q "alias gpio_scan=" "$ALIASES_FILE" 2>/dev/null; then
+    echo "alias gpio_scan='/opt/rasppi-remote/gpio_scan.sh'" >> "$ALIASES_FILE"
+fi
+if ! grep -q "alias system_updates=" "$ALIASES_FILE" 2>/dev/null; then
+    echo "alias system_updates='/opt/rasppi-remote/system_updates.sh'" >> "$ALIASES_FILE"
+fi
+if ! grep -q "alias system_upgrade=" "$ALIASES_FILE" 2>/dev/null; then
+    echo "alias system_upgrade='/opt/rasppi-remote/system_upgrade.sh'" >> "$ALIASES_FILE"
+    echo "alias sys_upgrade='/opt/rasppi-remote/system_upgrade.sh'" >> "$ALIASES_FILE"
+fi
+
+if [ "$USER_HOME" != "/root" ]; then
+    chown "$REAL_USER":"$REAL_USER" "$ALIASES_FILE" 2>/dev/null || true
+fi
+
+# 5. Prepare auth log file
 touch /var/log/rasppi-remote-auth.log
 chmod 600 /var/log/rasppi-remote-auth.log
 chown root:root /var/log/rasppi-remote-auth.log
 
-# 4. Generate main Python API server
+# 6. Generate main Python API server
 cat << 'EOF_PYTHON' > "$APP_DIR/garmin_api.py"
 from flask import Flask, jsonify, request
 import subprocess, os, logging, hmac, time, ipaddress, re, threading, pwd, shlex
@@ -335,6 +441,9 @@ COMMANDS = {
         fi
     """.strip(),
     "userservices": "/opt/rasppi-remote/user_services.sh",
+    "gpio_scan": "/opt/rasppi-remote/gpio_scan.sh",
+    "system_updates": "/opt/rasppi-remote/system_updates.sh",
+    "system_upgrade": "/opt/rasppi-remote/system_upgrade.sh &",
     "docker_status": """
         if ! command -v docker &> /dev/null; then
             echo "🐳 Docker not installed"
@@ -480,7 +589,7 @@ def get_system_aliases():
                                         cmd = cmd[1:-1]
                                         if quote_char == '"':
                                             cmd = cmd.replace('\\$', '$').replace('\\"', '"').replace('\\`', '`').replace('\\\\', '\\')
-                                    aliases[name] = {"cmd": cmd, "owner": file_owner}
+                                        aliases[name] = {"cmd": cmd, "owner": file_owner}
                             except Exception:
                                 pass
                         elif not line.startswith("#"):
@@ -596,10 +705,10 @@ if __name__ == '__main__':
 EOF_PYTHON
 
 chown -R root:root "$APP_DIR"
-chmod 755 "$APP_DIR" "$APP_DIR/user_services.sh" "$APP_DIR/top_hogs.sh"
+chmod 755 "$APP_DIR" "$APP_DIR/user_services.sh" "$APP_DIR/top_hogs.sh" "$APP_DIR/gpio_scan.sh" "$APP_DIR/system_updates.sh" "$APP_DIR/system_upgrade.sh"
 chmod 600 "$APP_DIR/garmin_api.py"
 
-# 5. Create CLI helper tool 'rasppi-remote'
+# 7. Create CLI helper tool 'rasppi-remote'
 cat << 'EOF_CLI' > /usr/local/bin/rasppi-remote
 #!/bin/bash
 if [ "$EUID" -ne 0 ]; then
@@ -635,6 +744,7 @@ Wants=network-online.target tailscaled.service
 After=network-online.target tailscaled.service
 
 [Service]
+Environment="LANG=C.UTF-8"
 EnvironmentFile=/etc/default/rasppi-remote
 ExecStart=/usr/bin/python3 /opt/rasppi-remote/garmin_api.py
 WorkingDirectory=/opt/rasppi-remote
